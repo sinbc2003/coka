@@ -680,6 +680,8 @@ struct SharedData {
     polling_time_ms: u64,
     /// Schedule IDs currently being executed or pending, per chat
     pending_schedules: HashMap<ChatId, std::collections::HashSet<String>>,
+    /// Message queue: messages received while AI is busy, processed after completion
+    message_queue: HashMap<ChatId, Vec<String>>,
 }
 
 type SharedState = Arc<Mutex<SharedData>>;
@@ -927,6 +929,7 @@ pub async fn run_bot(token: &str) {
         api_timestamps: HashMap::new(),
         polling_time_ms,
         pending_schedules: HashMap::new(),
+        message_queue: HashMap::new(),
     }));
 
     println!("  ✓ Bot connected — Listening for messages");
@@ -1061,14 +1064,19 @@ async fn handle_message(
             };
             if let Some(text) = text_part {
                 if !text.is_empty() {
-                    // Block if an AI request is already in progress
+                    // Queue if an AI request is already in progress
                     let ai_busy = {
                         let data = state.lock().await;
                         data.cancel_tokens.contains_key(&chat_id)
                     };
                     if ai_busy {
+                        let mut data = state.lock().await;
+                        let queue = data.message_queue.entry(chat_id).or_insert_with(Vec::new);
+                        let queue_pos = queue.len() + 1;
+                        queue.push(text.to_string());
+                        drop(data);
                         shared_rate_limit_wait(&state, chat_id).await;
-                        tg!("send_message", bot.send_message(chat_id, "AI request in progress. Use /stop to cancel.")
+                        tg!("send_message", bot.send_message(chat_id, format!("📥 큐에 추가됨 ({}번째). 현재 작업 완료 후 자동 처리됩니다.", queue_pos))
                             .await)?;
                     } else {
                         handle_text_message(&bot, chat_id, text, &state).await?;
@@ -1183,13 +1191,16 @@ async fn handle_message(
         return Ok(());
     }
 
-    // Block all messages except /stop while an AI request is in progress
+    // Queue messages while AI is busy (except /stop)
     if !text.starts_with("/stop") {
-        let data = state.lock().await;
+        let mut data = state.lock().await;
         if data.cancel_tokens.contains_key(&chat_id) {
+            let queue = data.message_queue.entry(chat_id).or_insert_with(Vec::new);
+            let queue_pos = queue.len() + 1;
+            queue.push(text.to_string());
             drop(data);
             shared_rate_limit_wait(&state, chat_id).await;
-            tg!("send_message", bot.send_message(chat_id, "AI request in progress. Use /stop to cancel.")
+            tg!("send_message", bot.send_message(chat_id, format!("📥 큐에 추가됨 ({}번째). 현재 작업 완료 후 자동 처리됩니다.", queue_pos))
                 .await)?;
             return Ok(());
         }
@@ -3628,7 +3639,10 @@ async fn handle_text_message(
     // This allows teloxide's per-chat worker to process subsequent messages (e.g. /stop).
     let bot_owned = bot.clone();
     let state_owned = state.clone();
+    let bot_key_owned = token_hash(bot.token());
+    let disabled_notice_owned = disabled_notice.clone();
     let user_text_owned = user_text.to_string();
+    let current_path_for_spawn = current_path.clone();
     let provider_str: &'static str = if model.is_some() {
         if codex::is_codex_model(model.as_deref()) { "codex" } else { "claude" }
     } else if !claude::is_claude_available() && codex::is_codex_available() {
@@ -3643,6 +3657,20 @@ async fn handle_text_message(
             "🕖 Process",     "🕗 Processi",    "🕘 Processin",
             "🕙 Processing",  "🕚 Processing.", "🕛 Processing..",
         ];
+
+        let (polling_time_ms, silent_mode) = {
+            let data = state_owned.lock().await;
+            (data.polling_time_ms, is_silent(&data.settings, chat_id))
+        };
+
+        // Queue processing outer loop: processes current message, then any queued messages
+        let mut current_rx = rx;
+        let mut current_cancel_token = cancel_token;
+        let mut current_placeholder_msg_id = placeholder_msg_id;
+        let mut current_user_text = user_text_owned;
+        let mut current_path_loop = current_path_for_spawn;
+
+        loop { // <<< queue consumption loop
         let mut full_response = String::new();
         let mut last_edit_text = String::new();
         let mut done = false;
@@ -3652,15 +3680,11 @@ async fn handle_text_message(
         let mut pending_cokacdir = false;
         let mut last_tool_name: String = String::new();
 
-        let (polling_time_ms, silent_mode) = {
-            let data = state_owned.lock().await;
-            (data.polling_time_ms, is_silent(&data.settings, chat_id))
-        };
         let mut queue_done = false;
         let mut response_rendered = false;
         while !done || !queue_done {
             // Check cancel token
-            if cancel_token.cancelled.load(Ordering::Relaxed) {
+            if current_cancel_token.cancelled.load(Ordering::Relaxed) {
                 if !done { cancelled = true; }
                 break;
             }
@@ -3669,7 +3693,7 @@ async fn handle_text_message(
             tokio::time::sleep(tokio::time::Duration::from_millis(polling_time_ms)).await;
 
             // Check cancel token again after sleep
-            if cancel_token.cancelled.load(Ordering::Relaxed) {
+            if current_cancel_token.cancelled.load(Ordering::Relaxed) {
                 if !done { cancelled = true; }
                 break;
             }
@@ -3678,7 +3702,7 @@ async fn handle_text_message(
             if !done {
                 // Drain all available messages
                 loop {
-                    match rx.try_recv() {
+                    match current_rx.try_recv() {
                         Ok(msg) => {
                             match msg {
                                 StreamMessage::Init { session_id: sid } => {
@@ -3791,7 +3815,7 @@ async fn handle_text_message(
                     // Rate limit: reserve slot right before the actual API call
                     shared_rate_limit_wait(&state_owned, chat_id).await;
                     let html_text = markdown_to_telegram_html(&display_text);
-                    if let Err(e) = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &html_text)
+                    if let Err(e) = tg!("edit_message", bot_owned.edit_message_text(chat_id, current_placeholder_msg_id, &html_text)
                         .parse_mode(ParseMode::Html)
                         .await)
                     {
@@ -3827,14 +3851,14 @@ async fn handle_text_message(
                 let html_response = markdown_to_telegram_html(&final_response);
 
                 if html_response.len() <= TELEGRAM_MSG_LIMIT {
-                    if let Err(e) = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &html_response)
+                    if let Err(e) = tg!("edit_message", bot_owned.edit_message_text(chat_id, current_placeholder_msg_id, &html_response)
                         .parse_mode(ParseMode::Html)
                         .await)
                     {
                         let ts = chrono::Local::now().format("%H:%M:%S");
                         println!("  [{ts}]   ⚠ edit_message failed (HTML): {e}");
                         shared_rate_limit_wait(&state_owned, chat_id).await;
-                        let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &final_response)
+                        let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, current_placeholder_msg_id, &final_response)
                             .await);
                     }
                 } else {
@@ -3842,7 +3866,7 @@ async fn handle_text_message(
                     match send_result {
                         Ok(_) => {
                             shared_rate_limit_wait(&state_owned, chat_id).await;
-                            let _ = tg!("delete_message", bot_owned.delete_message(chat_id, placeholder_msg_id).await);
+                            let _ = tg!("delete_message", bot_owned.delete_message(chat_id, current_placeholder_msg_id).await);
                         }
                         Err(e) => {
                             let ts = chrono::Local::now().format("%H:%M:%S");
@@ -3851,13 +3875,13 @@ async fn handle_text_message(
                             match fallback_result {
                                 Ok(_) => {
                                     shared_rate_limit_wait(&state_owned, chat_id).await;
-                                    let _ = tg!("delete_message", bot_owned.delete_message(chat_id, placeholder_msg_id).await);
+                                    let _ = tg!("delete_message", bot_owned.delete_message(chat_id, current_placeholder_msg_id).await);
                                 }
                                 Err(e2) => {
                                     println!("  [{ts}]   ⚠ send_long_message failed (plain): {e2}");
                                     shared_rate_limit_wait(&state_owned, chat_id).await;
                                     let truncated = truncate_str(&final_response, TELEGRAM_MSG_LIMIT);
-                                    let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &truncated)
+                                    let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, current_placeholder_msg_id, &truncated)
                                         .await);
                                 }
                             }
@@ -3882,13 +3906,13 @@ async fn handle_text_message(
                         }
                         session.history.push(HistoryItem {
                             item_type: HistoryType::User,
-                            content: user_text_owned.clone(),
+                            content: current_user_text.clone(),
                         });
                         session.history.push(HistoryItem {
                             item_type: HistoryType::Assistant,
                             content: final_response,
                         });
-                        save_session_to_file(session, &current_path, provider_str);
+                        save_session_to_file(session, &current_path_loop, provider_str);
                         msg_debug(&format!("[polling] session saved: session_id={:?}, history_len={}",
                             session.session_id, session.history.len()));
                     }
@@ -3907,7 +3931,7 @@ async fn handle_text_message(
 
         // === Post-loop: cancelled handling or lock release ===
         if cancelled {
-            if let Ok(guard) = cancel_token.child_pid.lock() {
+            if let Ok(guard) = current_cancel_token.child_pid.lock() {
                 if let Some(pid) = *guard {
                     #[cfg(unix)]
                     unsafe {
@@ -3929,14 +3953,14 @@ async fn handle_text_message(
 
             let html_stopped = markdown_to_telegram_html(&stopped_response);
             if html_stopped.len() <= TELEGRAM_MSG_LIMIT {
-                if let Err(e) = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &html_stopped)
+                if let Err(e) = tg!("edit_message", bot_owned.edit_message_text(chat_id, current_placeholder_msg_id, &html_stopped)
                     .parse_mode(ParseMode::Html)
                     .await)
                 {
                     let ts_err = chrono::Local::now().format("%H:%M:%S");
                     println!("  [{ts_err}]   ⚠ edit_message failed (stopped/HTML): {e}");
                     shared_rate_limit_wait(&state_owned, chat_id).await;
-                    let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &stopped_response)
+                    let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, current_placeholder_msg_id, &stopped_response)
                         .await);
                 }
             } else {
@@ -3944,7 +3968,7 @@ async fn handle_text_message(
                 match send_result {
                     Ok(_) => {
                         shared_rate_limit_wait(&state_owned, chat_id).await;
-                        let _ = tg!("delete_message", bot_owned.delete_message(chat_id, placeholder_msg_id).await);
+                        let _ = tg!("delete_message", bot_owned.delete_message(chat_id, current_placeholder_msg_id).await);
                     }
                     Err(e) => {
                         let ts_err = chrono::Local::now().format("%H:%M:%S");
@@ -3953,12 +3977,12 @@ async fn handle_text_message(
                         match fallback {
                             Ok(_) => {
                                 shared_rate_limit_wait(&state_owned, chat_id).await;
-                                let _ = tg!("delete_message", bot_owned.delete_message(chat_id, placeholder_msg_id).await);
+                                let _ = tg!("delete_message", bot_owned.delete_message(chat_id, current_placeholder_msg_id).await);
                             }
                             Err(_) => {
                                 shared_rate_limit_wait(&state_owned, chat_id).await;
                                 let truncated = truncate_str(&stopped_response, TELEGRAM_MSG_LIMIT);
-                                let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, placeholder_msg_id, &truncated)
+                                let _ = tg!("edit_message", bot_owned.edit_message_text(chat_id, current_placeholder_msg_id, &truncated)
                                     .await);
                             }
                         }
@@ -3985,31 +4009,190 @@ async fn handle_text_message(
                 }
                 session.history.push(HistoryItem {
                     item_type: HistoryType::User,
-                    content: user_text_owned,
+                    content: current_user_text,
                 });
                 session.history.push(HistoryItem {
                     item_type: HistoryType::Assistant,
                     content: stopped_response,
                 });
-                save_session_to_file(session, &current_path, provider_str);
+                save_session_to_file(session, &current_path_loop, provider_str);
             }
             data.cancel_tokens.remove(&chat_id);
             data.stop_message_ids.remove(&chat_id);
-            return;
+            // Clear queue on /stop
+            data.message_queue.remove(&chat_id);
+            break; // exit queue consumption loop
         }
 
-        // Atomically remove both cancel_tokens and stop_message_ids to prevent
-        // race with /stop handler inserting a stop_msg_id between two separate locks
-        let orphan_stop_msg = {
+        // === Queue processing: pop next queued message and loop ===
+        let (orphan_stop_msg, queued_msg) = {
             let mut data = state_owned.lock().await;
             let msg_id = data.stop_message_ids.remove(&chat_id);
             data.cancel_tokens.remove(&chat_id);
-            msg_id
+            let next = data.message_queue.get_mut(&chat_id).and_then(|q| {
+                if q.is_empty() { None } else { Some(q.remove(0)) }
+            });
+            if data.message_queue.get(&chat_id).map_or(false, |q| q.is_empty()) {
+                data.message_queue.remove(&chat_id);
+            }
+            (msg_id, next)
         };
         if let Some(msg_id) = orphan_stop_msg {
             shared_rate_limit_wait(&state_owned, chat_id).await;
             let _ = tg!("delete_message", bot_owned.delete_message(chat_id, msg_id).await);
         }
+
+        let queued_text = match queued_msg {
+            None => break, // no more queued messages, exit loop
+            Some(t) => t,
+        };
+
+        // --- Prepare to process the queued message ---
+        let remaining = {
+            let data = state_owned.lock().await;
+            data.message_queue.get(&chat_id).map_or(0, |q| q.len())
+        };
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        println!("  [{ts}] 📥 Processing queued message ({} remaining in queue)", remaining);
+
+        // Send new placeholder for queued message
+        shared_rate_limit_wait(&state_owned, chat_id).await;
+        let ph_result = tg!("send_message", bot_owned.send_message(
+            chat_id,
+            format!("📥 큐 처리 중: {}\n\n...", truncate_str(&queued_text, 100))
+        ).await);
+        let new_placeholder_msg_id = match ph_result {
+            Ok(msg) => msg.id,
+            Err(e) => {
+                let ts = chrono::Local::now().format("%H:%M:%S");
+                println!("  [{ts}]   ⚠ Failed to send queue placeholder: {e}");
+                break;
+            }
+        };
+        current_placeholder_msg_id = new_placeholder_msg_id;
+        current_user_text = queued_text.clone();
+
+        // Re-read session info for the queued message
+        let q_session_info = {
+            let mut data = state_owned.lock().await;
+            let info = data.sessions.get(&chat_id).and_then(|session| {
+                session.current_path.as_ref().map(|_| {
+                    (session.session_id.clone(), session.current_path.clone().unwrap_or_default())
+                })
+            });
+            let uploads = data.sessions.get_mut(&chat_id)
+                .map(|s| std::mem::take(&mut s.pending_uploads))
+                .unwrap_or_default();
+            let tools = get_allowed_tools(&data.settings, chat_id);
+            let mdl = get_model(&data.settings, chat_id);
+            let hist = data.sessions.get(&chat_id)
+                .map(|s| s.history.clone())
+                .unwrap_or_default();
+            (info, tools, uploads, mdl, hist)
+        };
+
+        let (q_info, q_allowed_tools, q_uploads, q_model, q_history) = q_session_info;
+        let (q_session_id, q_current_path) = match q_info {
+            Some(info) => info,
+            None => break, // no session, stop processing queue
+        };
+        current_path_loop = q_current_path.clone();
+
+        // Build prompt for queued message
+        let q_sanitized = ai_screen::sanitize_user_input(&queued_text);
+        let q_context_prompt = if q_uploads.is_empty() {
+            q_sanitized
+        } else {
+            let upload_ctx = q_uploads.join("\n");
+            format!("{}\n\n{}", upload_ctx, q_sanitized)
+        };
+
+        let q_system_prompt = build_system_prompt(
+            "You are chatting with a user through Telegram.",
+            &q_current_path, chat_id.0, &bot_key_owned, &disabled_notice_owned,
+            q_session_id.as_deref(),
+        );
+
+        // Create new cancel token and channel
+        let q_cancel_token = Arc::new(CancelToken::new());
+        {
+            let mut data = state_owned.lock().await;
+            data.cancel_tokens.insert(chat_id, q_cancel_token.clone());
+        }
+        current_cancel_token = q_cancel_token.clone();
+
+        let (q_tx, q_rx) = mpsc::channel();
+        current_rx = q_rx;
+
+        // Spawn AI backend for queued message
+        let q_session_id_clone = q_session_id.clone();
+        let q_current_path_clone = q_current_path.clone();
+        let q_cancel_token_clone = q_cancel_token.clone();
+        let q_model_clone = q_model.clone();
+        let q_history_clone = q_history;
+        let q_allowed_clone = q_allowed_tools.clone();
+        let q_system_clone = q_system_prompt.clone();
+        let q_prompt_clone = q_context_prompt.clone();
+        tokio::task::spawn_blocking(move || {
+            let use_codex = if q_model_clone.is_some() {
+                codex::is_codex_model(q_model_clone.as_deref())
+            } else {
+                !claude::is_claude_available() && codex::is_codex_available()
+            };
+            let result = if use_codex {
+                let codex_model = q_model_clone.as_deref().and_then(codex::strip_codex_prefix);
+                let codex_prompt = if q_history_clone.is_empty() {
+                    q_prompt_clone.clone()
+                } else {
+                    let mut conv = String::new();
+                    conv.push_str("<conversation_history>\n");
+                    for item in &q_history_clone {
+                        let role = match item.item_type {
+                            HistoryType::User => "User",
+                            HistoryType::Assistant => "Assistant",
+                            HistoryType::ToolUse => "ToolUse",
+                            HistoryType::ToolResult => "ToolResult",
+                            _ => continue,
+                        };
+                        conv.push_str(&format!("[{}]: {}\n", role, item.content));
+                    }
+                    conv.push_str("</conversation_history>\n\n");
+                    conv.push_str(&q_prompt_clone);
+                    conv
+                };
+                let codex_sys = format!("{}{}", q_system_clone, codex_extra_instructions());
+                codex::execute_command_streaming(
+                    &codex_prompt,
+                    q_session_id_clone.as_deref(),
+                    &q_current_path_clone,
+                    q_tx.clone(),
+                    Some(&codex_sys),
+                    Some(&q_allowed_clone),
+                    Some(q_cancel_token_clone),
+                    codex_model,
+                    false,
+                )
+            } else {
+                let claude_model = q_model_clone.as_deref().and_then(claude::strip_claude_prefix);
+                claude::execute_command_streaming(
+                    &q_prompt_clone,
+                    q_session_id_clone.as_deref(),
+                    &q_current_path_clone,
+                    q_tx.clone(),
+                    Some(&q_system_clone),
+                    Some(&q_allowed_clone),
+                    Some(q_cancel_token_clone),
+                    claude_model,
+                    false,
+                )
+            };
+            if let Err(e) = result {
+                let _ = q_tx.send(StreamMessage::Error { message: e, stdout: String::new(), stderr: String::new(), exit_code: None });
+            }
+        });
+
+        // Loop back to polling for the queued message
+        } // end of queue consumption loop
     });
 
     Ok(())
