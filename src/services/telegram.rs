@@ -5212,6 +5212,7 @@ async fn execute_schedule(
     let state_owned = state.clone();
     let entry_clone = entry.clone();
     let workspace_path_owned = workspace_path.clone();
+    let token_owned = token.to_string();
     tokio::spawn(async move {
         const SPINNER: &[&str] = &[
             "🕐 P",           "🕑 Pr",          "🕒 Pro",
@@ -5531,6 +5532,11 @@ async fn execute_schedule(
                 // No prior session existed — remove the schedule's temporary session
                 data.sessions.remove(&chat_id);
             }
+            // Update last_sessions to point to the schedule workspace
+            // so that follow-up messages auto-restore to this context
+            data.settings.last_sessions.insert(chat_id.0.to_string(), workspace_path.clone());
+            save_bot_settings(&token_owned, &data.settings);
+            sched_debug(&format!("[execute_schedule] id={}, updated last_sessions to {}", schedule_id, workspace_path));
         }
         sched_debug(&format!("[execute_schedule] id={}, END", schedule_id));
 
